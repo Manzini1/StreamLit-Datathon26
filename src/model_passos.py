@@ -68,6 +68,27 @@ def choose_target(df: pd.DataFrame, requested: str = "auto", min_labeled_rows: i
     raise ValueError("Nenhum target utilizável encontrado (ou sem volume suficiente).")
 
 
+def _sanitize_for_sklearn(X: pd.DataFrame, numeric_cols: list[str], categorical_cols: list[str]) -> pd.DataFrame:
+    """Normaliza dtypes/missings para evitar erros com pandas StringDtype/pd.NA no scikit-learn."""
+    X = X.copy()
+
+    # Numéricas: força float (np.nan como missing)
+    for c in numeric_cols:
+        if c in X.columns:
+            X[c] = pd.to_numeric(X[c], errors="coerce").astype("float64")
+
+    # Categóricas: converte para object e troca pd.NA por np.nan
+    for c in categorical_cols:
+        if c in X.columns:
+            s = X[c]
+            # evita manter StringDtype/BooleanDtype/Int64 nullable no sklearn
+            s = s.astype("object")
+            s = s.where(pd.notna(s), np.nan)
+            X[c] = s
+
+    return X
+
+
 def build_feature_frame(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, pd.Series, dict[str, list[str]]]:
     work = df.copy()
 
@@ -95,6 +116,7 @@ def build_feature_frame(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame
         raise ValueError("Nenhuma feature disponível para treinar o modelo.")
 
     X = work[numeric_cols + categorical_cols].copy()
+    X = _sanitize_for_sklearn(X, numeric_cols=numeric_cols, categorical_cols=categorical_cols)
     schema = {"numeric": numeric_cols, "categorical": categorical_cols}
     return X, y, schema
 
@@ -110,6 +132,7 @@ def temporal_or_random_split(df_indexed: pd.DataFrame, y: pd.Series, random_stat
     def _is_valid(mask: pd.Series) -> bool:
         if mask is None:
             return False
+        mask = pd.Series(mask, index=df_indexed.index).fillna(False).astype(bool)
         if mask.sum() < 20 or (~mask).sum() < 20:
             return False
         y_tr = y.loc[~mask].dropna().astype(int)
@@ -121,7 +144,7 @@ def temporal_or_random_split(df_indexed: pd.DataFrame, y: pd.Series, random_stat
         uniq_years = sorted(years.unique())
         if len(uniq_years) >= 2:
             for test_year in reversed(uniq_years):
-                test_mask = pd.to_numeric(df_indexed["ano_referencia"], errors="coerce") == test_year
+                test_mask = (pd.to_numeric(df_indexed["ano_referencia"], errors="coerce") == test_year).fillna(False)
                 if _is_valid(test_mask):
                     return test_mask, test_year
 
@@ -372,10 +395,14 @@ def prepare_inference_frame(df: pd.DataFrame, bundle: dict[str, Any]) -> pd.Data
     for c in cols:
         if c not in X.columns:
             X[c] = np.nan
-    # tipos numéricos
-    for c in schema.get("numeric", []):
-        X[c] = pd.to_numeric(X[c], errors="coerce")
-    return X[cols]
+
+    X = X[cols].copy()
+    X = _sanitize_for_sklearn(
+        X,
+        numeric_cols=schema.get("numeric", []),
+        categorical_cols=schema.get("categorical", []),
+    )
+    return X
 
 
 def score_dataframe(df: pd.DataFrame, bundle: dict[str, Any]) -> pd.DataFrame:
