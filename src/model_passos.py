@@ -100,25 +100,50 @@ def build_feature_frame(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame
 
 
 def temporal_or_random_split(df_indexed: pd.DataFrame, y: pd.Series, random_state: int = 42):
-    """Split temporal usando ano mais recente no teste quando possível."""
+    """Split temporal usando ano mais recente no teste quando possível.
+
+    Retorna (test_mask, test_year). Se o split temporal não gerar classes suficientes
+    em treino e teste, cai para holdout aleatório estratificado.
+    """
+    y = pd.Series(y).reindex(df_indexed.index)
+
+    def _is_valid(mask: pd.Series) -> bool:
+        if mask is None:
+            return False
+        if mask.sum() < 20 or (~mask).sum() < 20:
+            return False
+        y_tr = y.loc[~mask].dropna().astype(int)
+        y_te = y.loc[mask].dropna().astype(int)
+        return y_tr.nunique() >= 2 and y_te.nunique() >= 2
+
     if "ano_referencia" in df_indexed.columns:
         years = pd.to_numeric(df_indexed["ano_referencia"], errors="coerce").dropna()
         uniq_years = sorted(years.unique())
         if len(uniq_years) >= 2:
-            test_year = uniq_years[-1]
-            test_mask = pd.to_numeric(df_indexed["ano_referencia"], errors="coerce") == test_year
-            if test_mask.sum() >= 20 and (~test_mask).sum() >= 20 and y.loc[test_mask.index].nunique() >= 1:
-                return test_mask, test_year
-    # fallback: holdout aleatório estratificado simples manual (sem importar train_test_split para preservar índice)
+            for test_year in reversed(uniq_years):
+                test_mask = pd.to_numeric(df_indexed["ano_referencia"], errors="coerce") == test_year
+                if _is_valid(test_mask):
+                    return test_mask, test_year
+
+    # fallback: holdout aleatório estratificado simples manual
     rng = np.random.RandomState(random_state)
     idx = df_indexed.index.to_numpy()
     y_vals = y.reindex(df_indexed.index)
+
     pos = idx[y_vals.values == 1]
     neg = idx[y_vals.values == 0]
+
+    if len(pos) == 0 or len(neg) == 0:
+        test_mask = df_indexed.index.to_series().isin([])
+        return test_mask, None
+
     rng.shuffle(pos)
     rng.shuffle(neg)
-    n_pos_test = max(1, int(0.2 * len(pos)))
-    n_neg_test = max(1, int(0.2 * len(neg)))
+
+    # Garante pelo menos 1 amostra por classe no treino e no teste, quando possível.
+    n_pos_test = min(max(1, int(round(0.2 * len(pos)))), max(1, len(pos) - 1))
+    n_neg_test = min(max(1, int(round(0.2 * len(neg)))), max(1, len(neg) - 1))
+
     test_idx = set(pos[:n_pos_test]).union(set(neg[:n_neg_test]))
     test_mask = df_indexed.index.to_series().isin(test_idx)
     return test_mask, None
@@ -223,68 +248,98 @@ def get_feature_importance_df(fitted_pipe: Pipeline) -> pd.DataFrame:
 
 def train_risk_model(df: pd.DataFrame, config: TrainConfig | None = None) -> dict[str, Any]:
     config = config or TrainConfig()
-    target_col = choose_target(df, requested=config.target_col, min_labeled_rows=config.min_labeled_rows)
 
-    X, y, schema = build_feature_frame(df, target_col=target_col)
+    def _train_for_target(target_col: str) -> dict[str, Any]:
+        X, y, schema = build_feature_frame(df, target_col=target_col)
 
-    # split temporal se possível
-    split_ref = X.copy()
-    test_mask, test_year = temporal_or_random_split(split_ref, y, random_state=config.random_state)
-    X_train, X_test = X.loc[~test_mask], X.loc[test_mask]
-    y_train, y_test = y.loc[~test_mask], y.loc[test_mask]
+        if y.nunique() < 2:
+            raise ValueError(f"Target '{target_col}' possui classe única após limpeza.")
 
-    if y_train.nunique() < 2 or y_test.nunique() < 2:
-        raise ValueError(
-            "Split gerou classe única em treino ou teste. Tente target diferente ou mais dados rotulados."
+        split_ref = X.copy()
+        test_mask, test_year = temporal_or_random_split(split_ref, y, random_state=config.random_state)
+        X_train, X_test = X.loc[~test_mask], X.loc[test_mask]
+        y_train, y_test = y.loc[~test_mask], y.loc[test_mask]
+
+        if y_train.nunique() < 2 or y_test.nunique() < 2:
+            raise ValueError(
+                f"Split inválido para target '{target_col}': classe única em treino ou teste."
+            )
+
+        models = build_models(schema, random_state=config.random_state)
+        fitted = {}
+        scores = []
+        for name, pipe in models.items():
+            pipe.fit(X_train, y_train)
+            prob = pipe.predict_proba(X_test)[:, 1]
+            metrics = evaluate_binary(y_test, prob, threshold=config.threshold)
+            fitted[name] = {"pipeline": pipe, "metrics": metrics, "y_prob_test": prob}
+            scores.append((name, metrics.get("average_precision", np.nan), metrics.get("roc_auc", np.nan)))
+
+        scores_sorted = sorted(
+            scores,
+            key=lambda x: (np.nan_to_num(x[1], nan=-1), np.nan_to_num(x[2], nan=-1)),
+            reverse=True,
         )
+        best_name = scores_sorted[0][0]
+        best_pipe = fitted[best_name]["pipeline"]
 
-    models = build_models(schema, random_state=config.random_state)
-    fitted = {}
-    scores = []
-    for name, pipe in models.items():
-        pipe.fit(X_train, y_train)
-        prob = pipe.predict_proba(X_test)[:, 1]
-        metrics = evaluate_binary(y_test, prob, threshold=config.threshold)
-        fitted[name] = {"pipeline": pipe, "metrics": metrics, "y_prob_test": prob}
-        scores.append((name, metrics.get("average_precision", np.nan), metrics.get("roc_auc", np.nan)))
+        all_prob = best_pipe.predict_proba(X)[:, 1]
+        scored = X.copy()
+        scored[target_col] = y.values
+        scored["prob_risco"] = all_prob
+        scored["pred_risco"] = (scored["prob_risco"] >= config.threshold).astype(int)
 
-    # Seleção prioriza AP e depois ROC-AUC
-    scores_sorted = sorted(scores, key=lambda x: (np.nan_to_num(x[1], nan=-1), np.nan_to_num(x[2], nan=-1)), reverse=True)
-    best_name = scores_sorted[0][0]
-    best_pipe = fitted[best_name]["pipeline"]
+        fi_df = get_feature_importance_df(best_pipe)
 
-    # Score em toda base rotulada
-    all_prob = best_pipe.predict_proba(X)[:, 1]
-    scored = X.copy()
-    scored[target_col] = y.values
-    scored["prob_risco"] = all_prob
-    scored["pred_risco"] = (scored["prob_risco"] >= config.threshold).astype(int)
+        result = {
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "target_col": target_col,
+            "threshold": config.threshold,
+            "split": {
+                "type": "temporal_latest_valid_year" if test_year is not None else "random_holdout",
+                "test_year": int(test_year) if test_year is not None else None,
+                "n_train": int(len(X_train)),
+                "n_test": int(len(X_test)),
+            },
+            "schema": schema,
+            "candidate_metrics": {k: v["metrics"] for k, v in fitted.items()},
+            "best_model_name": best_name,
+            "best_metrics": fitted[best_name]["metrics"],
+            "pipeline": best_pipe,
+            "feature_importance": fi_df,
+            "y_test": y_test,
+            "y_prob_test": fitted[best_name]["y_prob_test"],
+            "X_test": X_test,
+            "scored_labeled": scored,
+        }
+        return result
 
-    # Importâncias
-    fi_df = get_feature_importance_df(best_pipe)
+    if config.target_col != "auto":
+        return _train_for_target(config.target_col)
 
-    result = {
-        "created_at": datetime.utcnow().isoformat() + "Z",
-        "target_col": target_col,
-        "threshold": config.threshold,
-        "split": {
-            "type": "temporal_latest_year" if test_year is not None else "random_holdout",
-            "test_year": int(test_year) if test_year is not None else None,
-            "n_train": int(len(X_train)),
-            "n_test": int(len(X_test)),
-        },
-        "schema": schema,
-        "candidate_metrics": {k: v["metrics"] for k, v in fitted.items()},
-        "best_model_name": best_name,
-        "best_metrics": fitted[best_name]["metrics"],
-        "pipeline": best_pipe,
-        "feature_importance": fi_df,
-        "y_test": y_test,
-        "y_prob_test": fitted[best_name]["y_prob_test"],
-        "X_test": X_test,
-        "scored_labeled": scored,
-    }
-    return result
+    tried_errors: dict[str, str] = {}
+    priority = ["piora_defasagem_prox_ano", "risco_defasagem_atual", "risco_defasagem_severo"]
+    for t in priority:
+        if t not in df.columns:
+            continue
+        vals = pd.to_numeric(df[t], errors="coerce").dropna()
+        if len(vals) < config.min_labeled_rows:
+            continue
+        vals_int = pd.to_numeric(vals, errors="coerce").dropna().astype(int)
+        if vals_int.nunique() < 2:
+            continue
+        try:
+            res = _train_for_target(t)
+            res["auto_target_fallback_log"] = tried_errors
+            return res
+        except Exception as e:
+            tried_errors[t] = str(e)
+
+    raise ValueError(
+        "Nenhum target com split válido em modo auto. "
+        f"Tentativas: {tried_errors}. "
+        "Selecione 'risco_defasagem_atual' no app ou adicione mais dados rotulados."
+    )
 
 
 def save_model_bundle(train_result: dict[str, Any], outpath: str | Path) -> Path:
